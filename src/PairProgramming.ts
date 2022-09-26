@@ -10,6 +10,29 @@ type PointerData = {
 const POINTER_PROJECT_NAME = "~PairProgrammingPointer";
 const PP_PROJECT_PREFIX = "~PairShare-";
 
+/**
+ * Workflow:
+ * Start pair programming session
+ * Enter partner's username
+ * Check if partner has matching session:
+ *   If yes: connect, set sessionID
+ *     If sessionID != my sessionID and I have a sessionID, replace and repost my session
+ *     Post message to tell partner to "retry"
+ *   If no: post session, say "waiting for partner" with "retry" option
+ *     Every 5 seconds, or if retry, check again
+ * Once connected, say "Connected! and give instructions"
+ *
+*/
+
+export enum SessionResult {
+    WaitingForPartnerToConnect,
+    ConnectedToPartner,
+    PartnerSessionNotStarted,
+    PartnerHasOtherPartner,
+    PartnerSessionInvalid,
+    NetworkError,
+}
+
 export class IO {
 
     sessionID: string;
@@ -57,43 +80,66 @@ export class IO {
         return this.sessionID != null && Cloud.Utils.isLoggedIn();
     }
 
-    async startSession(partnerName: string) : Promise<string> {
+    async startSession(partnerName: string) : Promise<SessionResult> {
         if (!Cloud.Utils.isLoggedIn()) return null;
-        this.sessionID = newGuid();
         this.partnerName = partnerName;
         try {
-            await Cloud.Utils.saveProject(POINTER_PROJECT_NAME,
-                this.createPointerProject());
-            await Cloud.Utils.shareProject(POINTER_PROJECT_NAME);
+            let result = await this.tryJoinOrVerifyPartner();
+            if (result == SessionResult.ConnectedToPartner) return result;
+            await this.startNewSession();
+            return SessionResult.WaitingForPartnerToConnect;
         } catch (e) {
             console.error('Failed to create pair programming session', e);
             this.endSession();
-            return null;
+            return SessionResult.NetworkError;
         }
-        return this.sessionID;
     }
 
-    async verifySession() : Promise<boolean> {
+    private async startNewSession() {
+        this.sessionID = newGuid();
+        this.updatePointerProject();
+    }
+
+    private async updatePointerProject() : Promise<void> {
+        await Cloud.Utils.saveProject(POINTER_PROJECT_NAME,
+            this.createPointerProject());
+        await Cloud.Utils.shareProject(POINTER_PROJECT_NAME);
+    }
+
+    async tryJoinOrVerifyPartner() : Promise<SessionResult> {
         try {
-            let xml = await Cloud.Utils.getPublicProject(
-                POINTER_PROJECT_NAME, this.partnerName);
-            let serializer = Snap.IDE.serializer as XML_Serializer;
-            console.log(xml);
-            let model = serializer.parse(xml);
-            console.log(model);
-            let notes = model?.children[0]?.attributes?.notes;
-            console.log(notes);
-            if (!notes) return false;
-            notes = notes.replace(/'/g, '"');
-            let pointerData = JSON.parse(notes);
-            console.log(pointerData);
-            return true;
-            // TODO parse XML and extract notes
+            let partnerData = await this.getPartnerPointerData();
+            if (!partnerData) return SessionResult.PartnerSessionNotStarted;
+            if (partnerData.partnerName != Snap.cloud.username) {
+                return SessionResult.PartnerHasOtherPartner;
+            }
+            if (!partnerData.sessionID) {
+                return SessionResult.PartnerSessionInvalid;
+            }
+            if (this.sessionID != partnerData.sessionID) {
+                this.sessionID = partnerData.sessionID;
+                await this.updatePointerProject();
+            }
+            return SessionResult.ConnectedToPartner;
         } catch (e) {
-            console.error('Failed to verify session', e);
-            return false;
+            return SessionResult.PartnerSessionNotStarted;
         }
-        return true;
+    }
+
+    async getPartnerPointerData() : Promise<PointerData> {
+        let xml = await Cloud.Utils.getPublicProject(
+            POINTER_PROJECT_NAME, this.partnerName);
+        let serializer = Snap.IDE.serializer as XML_Serializer;
+        let model = serializer.parse(xml);
+        let notes = model?.children[0]?.attributes?.notes;
+        if (!notes) return null;
+        notes = notes.replace(/'/g, '"');
+        try {
+            return JSON.parse(notes) as PointerData;
+        } catch (e) {
+            console.warn('Improper notes data', notes);
+            return null;
+        }
     }
 
     static isTempProject(name: string): boolean {
@@ -110,7 +156,7 @@ export class IO {
         }
     }
 
-    async save(share = false) : Promise<boolean> {
+    async save(share = true) : Promise<boolean> {
         if (!this.isInSession) return false;
         let projectName = this.getProjectSaveName();
         let data = Cloud.Utils.getCurrentProjectData(true);
